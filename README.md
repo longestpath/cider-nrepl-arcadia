@@ -1,6 +1,6 @@
-# Cider NRepl Arcadia
+# Cider NRepl Arcadia Unity
 
-This is the result of exploring NRepl, and being really excited by Arcadia.
+This is the result of exploring NRepl, and being really excited by Arcadia in Unity.
 
 While the miracle repl is very nice, my workflow is more cuited around NRepl and specifically Cider, so this is an attempt to start from the Arcadia NRepl code and port it over to something that can be used a bit more like nrepl/nrepl.
 
