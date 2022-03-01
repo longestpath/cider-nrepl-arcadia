@@ -11,9 +11,11 @@
            ;; Arcadia Only
            [UnityEngine GameObject]))
 
-;; GOAL: Make this namespace a place where REPL events can be handled much like the repl callbacks of the NRepl implementation.
+;; GOAL: Make this namespace a place where REPL events can be handled much like the repl callbacks of the nREPL implementation.
 ;; -- I just want something that I can ship with the thing in order to start an interactive coding experience.
 ;; Process: Find out the opcodes through Unity and just figure them out one by one
+;; Documentation: This is the structure and design of nREPL. This set of docs also contains a lot about the specifics of the transport and protocol https://nrepl.org/nrepl/design/overview.html
+;; TODO: How to make cider-jack-in work? Can it work in CLR?
 
 (def ^:const port 37222) ;; My own REPL
 
@@ -31,11 +33,14 @@
 ;;   without requiring an editor callback
 (defonce repl-eval-queue (atom []))
 (defn maybe-eval-queued-action []
+  ;; TODO: In order to provide interruption, I think I will need to figure
+  ;; out how to handle a cancellation token here. Update shouldn't be
+  ;; throwing exceptions.
   (let [[action & rest] @repl-eval-queue]
     (when action
       (eval action)
       (reset! repl-eval-queue rest))))
-(defonce repl-main-obj (let [obj (GameObject. "NRepl")]
+(defonce repl-main-obj (let [obj (GameObject. "nREPL")]
                          a/hook+ obj :update :repl #'maybe-eval-queued-action))
 
 (def default-session-bindings
@@ -129,10 +134,11 @@
   (let [op-value                        (get message "op")
         auto-completion-support-enabled false
         session                         (get message "session" (new-session))]
+    ;; All ops are documented here:
+    ;; - https://nrepl.org/nrepl/ops.html
     (case (str op-value)
       "clone"
       (let [cloned-session (clone-session session)]
-        (a/log "CLONE")
         (send-message
          (bdict
           {"id"          (get message "id")
@@ -149,6 +155,7 @@
                                   "eldoc" 1
                                   "classpath" 1
                                   "complete" 1
+                                  ;; This also doesn't seem to work to get emacs to send a macroexpand op
                                   "macroexpand" 1})]
         (a/log "DESCRIBE")
         (send-message (bdict
@@ -166,14 +173,18 @@
                       @client))
       "eval"
       ;; Example eval. This is run by cider before running the actual code (I assume this is to switch the repl context to the proper namespace)
+      #_{"nrepl.middleware.print/print" "cider.nrepl.pprint/pprint", "file" "*cider-repl Assets/game:localhost:37222(clj)*", "line" 35, "code" "(clojure.core/apply clojure.core/require clojure.main/repl-requires)", "nrepl.middleware.print/options" {"right-margin" 74}, "id" "4", "op" "eval", "inhibit-cider-middleware" "true", "session" "be6aea4a-e326-4162-9e67-6e718c892402", "nrepl.middleware.print/stream?" "1", "nrepl.middleware.print/buffer-size" 4096, "nrepl.middleware.print/quota" 1048576, "column" 1}
       #_{"code" "(ns game.repl\n  (:require [arcadia.core :as a]\n            [arcadia.internal.config :as config]\n            [clojure.core])\n  (:import [System.Net.Sockets TcpListener]\n           [BencodeNET.Parsing BencodeParser]\n           [BencodeNET.Objects IBObject BDictionary BList BString BNumber]\n           [System Guid]\n           [System.Collections.Generic KeyValuePair]\n           [clojure.lang Namespace]\n           ;; Arcadia Only\n           [UnityEngine GameObject]))\n",
        "id" "21",
        "op" "eval",
-       "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
+         "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
+      ;; nREPL's eval Details: https://github.com/nrepl/nrepl/blob/8223894f6c46a2afd71398517d9b8fe91cdf715d/src/clojure/nrepl/middleware/interruptible_eval.clj#L57-L66
       (do
         (a/log "EVAL")
-        (a/log (str "eval MSG: " message)))
-      #_(swap! repl-eval-queue conj message)
+        (a/log (str "eval MSG: " message))
+        ;; TODO: Does this need to do anything with sessions? Queue per session? Context per session?
+        ;; TODO: Do I need to do something special with eval to switch into the proper namespace?
+        (swap! repl-eval-queue conj (read-string (get message "code"))))
       "load-file"
       ;; Example load-file
       #_{"file" "(ns game.core\n  (:require [arcadia.core :as a]\n            [arcadia.linear :as l]\n            [game.repl :as repl]\n            [game.utils :as utils])\n  (:import [UnityEngine\n            Application\n            QualitySettings\n            GameObject\n            Component\n            Transform]))\n\n(defn init-fps!\n  \"From Saikyun demo #2: https://www.youtube.com/watch?v=HoeUi2aOFxU&t=29s\"\n  [& _]\n  (set! (.. QualitySettings vSyncCount) 0)\n  (set! (.. Application targetFrameRate) 15))\n\n(defn load-hooks\n  \"\n  This function is to stash hooks that need to be added once while REPL developing. Add them here, then they will come back the next time.\n\n  This should possibly be an import time \\\"add\\\" and a post-import \\\"run\\\"\n  situation, so that each namespace can specify their own, but it's only\n  run once.\n  \"\n  []\n  (a/hook+ (a/object-named \"Main Camera\") :start :init-fps #'game.core/init-fps!))\n\n(defn start [& _]\n  (repl/start-server)\n  (utils/clean-scene)\n  (let [c1 (utils/create-primitive :cube \"BeheldCube\")]\n    (set! (.. c1 transform position)\n          (l/v3 3 3 3))\n    #_(a/hook+ c1 :update :moveit #'move!))\n  (utils/create-primitive :cube \"Hello World\"))\n\n;; How to persist hook adding in clojure? I feel like defonce might still be the way to do it, but the result of the hooks is def'd\n\n;; Start (does our clear on save)\n#_(start)\n\n;; Load our hooks (once)\n(defonce hooks-loaded (atom false))\n(when-not @hooks-loaded\n  (load-hooks)\n  (reset! hooks-loaded true))\n\n(comment\n  ;; This is how I added the first hook.\n  (a/hook+ (a/object-named \"Main Camera\") :start :main #'game.core/start)\n  (set! (.. (a/object-named \"Hello World\") transform position) (l/v3 3 3 3))\n  (a/destroy (a/object-named \"Hello World\"))\n\n  ;; TODO: Figure out how to ship this REPL and connect to it remotely.\n  ;; -- I think I can do it without modification of Arcadia using socket-repl, but then I'll have to use socket-repl...\n  ;; -- That said, it IS much more straightforward to run.\n  (init-fps!)\n\n  ;; Main goal: Have a space where you can manipulate the world. The way to do so, should be pluggable so it can be expanded.\n  ;; Interacting via hooks allows UnityUpdate stuff to be changed in real time.\n  ;; - So, interaction should be a hook on the character controller (or whatever that will end up being in VR)\n  ;; - That way I can develop everything interactively via the REPL.\n  (repl/start-server)\n  (repl/stop-server)\n  )\n\n(a/log \"reloaded core.clj!\")\n",
@@ -182,7 +193,11 @@
        "id" "43",
        "op" "load-file",
        "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
-      (a/log (str "load-file MSG: " message))
+      (do
+        (a/log (str "load-file MSG: " message))
+        ;; TODO: Should this do things with the file? Return values?
+        ;; NB> `file` contains the source of the whole file.
+        (swap! repl-eval-queue conj (read-string (get message "file"))))
       "eldoc"
       ;; Example eldoc
       #_{"id" "25",
@@ -200,6 +215,7 @@
       "classpath"
       ;; Classpath example
       ;; No idea what this does, but it happened on re-connect
+      ;; - Seems like it's not implemented? https://github.com/nrepl/nrepl/search?q=classpath
       ;; {"id" "155", "op" "classpath", "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
       (a/log (str "classpath MSG: " message))
       "close"
@@ -324,16 +340,11 @@
   (reset! @running false))
 
 (comment
-  ;; TODO: Need NRepl ops implemented
   ;; ‘cider-macroexpand-1’ requires the nREPL op "macroexpand".  Please, install (or update) cider-nrepl 0.15.1 and restart CIDER
   (validate-agent {:client-running true :client 123})
 
   (listener)
   (start-server)
-  ;; TODO: Accept client
-  ;; TODO: Log input received from cider client
-  ;; TODO: Implement each op when it's not found
-  ;; ...profit!
 
   (future (+ 1 1))
   (agent {:client-runnning false
