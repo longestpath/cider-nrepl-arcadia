@@ -6,6 +6,8 @@
            [BencodeNET.Parsing BencodeParser]
            [BencodeNET.Objects IBObject BDictionary BList BString BNumber]
            [System Guid]
+           [System.IO TextWriter]
+           [System.Text StringBuilder]
            [System.Collections.Generic KeyValuePair]
            [clojure.lang Namespace]
            ;; Arcadia Only
@@ -43,36 +45,64 @@
 (defonce repl-main-obj (let [obj (GameObject. "nREPL")]
                          a/hook+ obj :update :repl #'maybe-eval-queued-action))
 
+;; NB> These are the default bindings that make the eval happen in the
+;; proper session context.
 (def default-session-bindings
-  {}  #_{*ns* (Namespace/findOrCreate 'user)
-        *unchecked-math* false
-        *warn-on-reflection* false
-        *print-level* nil
-        *print-length* nil
-        *1 nil
-        *2 nil
-        *3 nil
-        *e nil
-        *math-context* nil})
+  {*ns* (Namespace/findOrCreate 'user)
+   *unchecked-math* false
+   *warn-on-reflection* false
+   *print-level* nil
+   *print-length* nil
+   *1 nil
+   *2 nil
+   *3 nil
+   *e nil
+   *math-context* nil})
 
 (declare repl-future)
 
-(defn new-session
+(defn send-message! [message client]
+  (let [bytes (.EncodeAsBytes message)]
+    (-> client
+        .GetStream
+        (.Write bytes 0 (.Length bytes)))))
+
+(defn writer [kind request client]
+  (let [id (str (get request "id"))
+        session (str (get-session request))
+        client client
+        kind kind
+        string-builder (StringBuilder.)]
+    (proxy [TextWriter] [kind request client]
+      (Encoding [] Encoding/UTF8)
+      (Write [value]
+        (.Append string-builder value))
+      (Flush []
+        (send-message!
+         (bdict {"id" id
+                 kind (.ToString string-builder)
+                 "session" session})
+         client)
+        (.Clear string-builder)))))
+
+(defn new-session!
   ([]
-   (new-session default-session-bindings))
+   (new-session! default-session-bindings))
   ([bindings]
    (let [new-guid (Guid/NewGuid)]
      (swap! sessions assoc new-guid bindings)
      new-guid)))
 
-(defn clone-session [original-guid]
-  (new-session (@sessions original-guid)))
+(defn clone-session! [original-guid]
+  (new-session! (@sessions original-guid)))
 
-(defn send-message [message client]
-  (let [bytes (.EncodeAsBytes message)]
-    (-> client
-        .GetStream
-        (.Write bytes 0 (.Length bytes)))))
+(defn get-session [message]
+  (if (get message "session")
+    (Guid/Parse (str (get message "session")))
+    (new-session!)))
+
+(defn update-session! [session new-bindings]
+  (swap! sessions update session merge new-bindings))
 
 (defn bnum [n]
   (BNumber. n))
@@ -128,18 +158,107 @@
     :default
     bobj))
 
+(defn find-file-ns [message]
+  ;; Look up from "file" to "Assets" to get the NS.
+  ;; NB> This can probably be done much easier through the message
+  ;; itself with `cider`... I think we get the ns for eval but I'm going
+  ;; to follow this through
+  (try
+    (let [[path current ns-list] (loop [path (str (get message "file"))
+                                       current nil
+                                       ns-list []]
+                                  (if (and (some? path)
+                                           (not= current "Assets"))
+                                    (recur (.FullName (Directory/GetParent path))
+                                           (Path/GetFileNameWithoutExtension path)
+                                           (conj ns-list current))
+                                    [path
+                                     current
+                                     (drop 1 (reverse ns-list))]))
+         full-ns (clojure.string/join "." ns-list)]
+     (a/log (str "Trying to find: " full-ns))
+     (let [result (find-ns full-ns)]
+       ;; Just logging for now to be verbose for conversion sake
+       (if result
+         (a/log (str "Found: " full-ns))
+         (a/log ":file was not a valid ns"))
+       result))
+    (catch Exception ex
+      (a/log ex)
+      (a/log ":file was not a valid ns"))))
+
+(defn do-eval [message]
+  (let [session          (get-session message)
+        code             (str (get message "code"))
+        session-bindings (get @sessions session)
+        out-writer       (writer "out" message @client)
+        err-writer       (writer "err" message @client)
+        ;; We want to change session context to ns in message before eval-ing
+        file-ns          (find-file-ns message)
+        eval-bindings    (come-> (assoc session-bindings
+                                        *out* out-writer
+                                        *err* err-writer)
+                                 file-ns (assoc *ns* file-ns))]
+    (def debug-eval-bindings eval-bindings)
+    ;; TODO: Does somthing need parsed here? Probably...
+    (with-bindings eval-bindings
+      (try
+        (let [result (eval (read-string {:read-cond :allow} code))
+              value  (pr-str result)]
+          ;; TODO: Is this right?
+          (var-set #'*3 *2)
+          (var-set #'*2 *1)
+          (var-set #'*1 result)
+          (update-session! session (get-thread-bindings))
+          (send-message! (bdict {"id"     (get message "id")
+                                 "value"   value
+                                 "ns"      (str *ns*)
+                                 "session" (str session)})
+                         @client)
+          (.Flush out-writer)
+          (.Flush err-writer)
+          (send-message! (bdict {"id" (get message "id")
+                                 "status" (blist ["done"]) ;; // TODO does this have to be a list?
+                                 "session" (str session)})
+                         @client)
+
+          )
+        (catch Exception e
+          (var-set #'*e e)
+          (update-session! session (get-thread-bindings))
+          (send-message! (bdict {"id" (get message "id")
+                                 "status" (blist ["eval-error"])
+                                 "session" (str session)
+                                 "ex" (str (type e)) ;; TODO: Can I return the whole thing here? For cider usage
+                                 })
+                         @client)
+          (send-message! (bdict {"id" (get message "id")
+                                 "session" (str session)
+                                 "err" (str (error-string e))})
+                         @client)
+          (send-message! (bdict {"id" (get message "id")
+                                 "status" (blist ["done"])
+                                 "session" (str session)
+                                 })
+                         @client)
+          (throw e)))))
+  ;; TODO: Unsure if this is needed, but it wants a null return so lets
+  ;; make it explicit
+  nil
+  )
+
 (defn handle-message [message]
   #_{:pre [(= (str k) "id") ;; Assumption: The first element is always "id"
            (> (count message) 0)]} ;; Assumption: There's going to be a "thing" per id of message
   (let [op-value                        (get message "op")
         auto-completion-support-enabled false
-        session                         (get message "session" (new-session))]
+        session                         (get message "session" (new-session!))]
     ;; All ops are documented here:
     ;; - https://nrepl.org/nrepl/ops.html
     (case (str op-value)
       "clone"
-      (let [cloned-session (clone-session session)]
-        (send-message
+      (let [cloned-session (clone-session! session)]
+        (send-message!
          (bdict
           {"id"          (get message "id")
            "status"      (blist ["done"])
@@ -158,7 +277,7 @@
                                   ;; This also doesn't seem to work to get emacs to send a macroexpand op
                                   "macroexpand" 1})]
         (a/log "DESCRIBE")
-        (send-message (bdict
+        (send-message! (bdict
                        {"id" (get message "id")
                         "session" (.ToString session)
                         "status" (blist ["done"])
@@ -184,7 +303,8 @@
         (a/log (str "eval MSG: " message))
         ;; TODO: Does this need to do anything with sessions? Queue per session? Context per session?
         ;; TODO: Do I need to do something special with eval to switch into the proper namespace?
-        (swap! repl-eval-queue conj (read-string (get message "code"))))
+        #_(swap! repl-eval-queue conj (read-string (get message "code")))
+        (do-eval message))
       "load-file"
       ;; Example load-file
       #_{"file" "(ns game.core\n  (:require [arcadia.core :as a]\n            [arcadia.linear :as l]\n            [game.repl :as repl]\n            [game.utils :as utils])\n  (:import [UnityEngine\n            Application\n            QualitySettings\n            GameObject\n            Component\n            Transform]))\n\n(defn init-fps!\n  \"From Saikyun demo #2: https://www.youtube.com/watch?v=HoeUi2aOFxU&t=29s\"\n  [& _]\n  (set! (.. QualitySettings vSyncCount) 0)\n  (set! (.. Application targetFrameRate) 15))\n\n(defn load-hooks\n  \"\n  This function is to stash hooks that need to be added once while REPL developing. Add them here, then they will come back the next time.\n\n  This should possibly be an import time \\\"add\\\" and a post-import \\\"run\\\"\n  situation, so that each namespace can specify their own, but it's only\n  run once.\n  \"\n  []\n  (a/hook+ (a/object-named \"Main Camera\") :start :init-fps #'game.core/init-fps!))\n\n(defn start [& _]\n  (repl/start-server)\n  (utils/clean-scene)\n  (let [c1 (utils/create-primitive :cube \"BeheldCube\")]\n    (set! (.. c1 transform position)\n          (l/v3 3 3 3))\n    #_(a/hook+ c1 :update :moveit #'move!))\n  (utils/create-primitive :cube \"Hello World\"))\n\n;; How to persist hook adding in clojure? I feel like defonce might still be the way to do it, but the result of the hooks is def'd\n\n;; Start (does our clear on save)\n#_(start)\n\n;; Load our hooks (once)\n(defonce hooks-loaded (atom false))\n(when-not @hooks-loaded\n  (load-hooks)\n  (reset! hooks-loaded true))\n\n(comment\n  ;; This is how I added the first hook.\n  (a/hook+ (a/object-named \"Main Camera\") :start :main #'game.core/start)\n  (set! (.. (a/object-named \"Hello World\") transform position) (l/v3 3 3 3))\n  (a/destroy (a/object-named \"Hello World\"))\n\n  ;; TODO: Figure out how to ship this REPL and connect to it remotely.\n  ;; -- I think I can do it without modification of Arcadia using socket-repl, but then I'll have to use socket-repl...\n  ;; -- That said, it IS much more straightforward to run.\n  (init-fps!)\n\n  ;; Main goal: Have a space where you can manipulate the world. The way to do so, should be pluggable so it can be expanded.\n  ;; Interacting via hooks allows UnityUpdate stuff to be changed in real time.\n  ;; - So, interaction should be a hook on the character controller (or whatever that will end up being in VR)\n  ;; - That way I can develop everything interactively via the REPL.\n  (repl/start-server)\n  (repl/stop-server)\n  )\n\n(a/log \"reloaded core.clj!\")\n",
