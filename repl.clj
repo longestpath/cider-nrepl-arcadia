@@ -1,12 +1,14 @@
 (ns game.repl
   (:require [arcadia.core :as a]
+            ;; TODO: Are these internal things okay to include?
             [arcadia.internal.config :as config]
+            [arcadia.internal.socket-repl :as socket-repl]
             [clojure.core])
   (:import [System.Net.Sockets TcpListener]
            [BencodeNET.Parsing BencodeParser]
            [BencodeNET.Objects IBObject BDictionary BList BString BNumber]
            [System Guid]
-           [System.IO TextWriter]
+           [System.IO TextWriter File Directory Path]
            [System.Text StringBuilder]
            [System.Collections.Generic KeyValuePair]
            [clojure.lang Namespace]
@@ -48,16 +50,16 @@
 ;; NB> These are the default bindings that make the eval happen in the
 ;; proper session context.
 (def default-session-bindings
-  {*ns* (Namespace/findOrCreate 'user)
-   *unchecked-math* false
-   *warn-on-reflection* false
-   *print-level* nil
-   *print-length* nil
-   *1 nil
-   *2 nil
-   *3 nil
-   *e nil
-   *math-context* nil})
+  {#'*ns* (Namespace/findOrCreate 'user)
+   #'*unchecked-math* false
+   #'*warn-on-reflection* false
+   #'*print-level* nil
+   #'*print-length* nil
+   #'*1 nil
+   #'*2 nil
+   #'*3 nil
+   #'*e nil
+   #'*math-context* nil})
 
 (declare repl-future)
 
@@ -67,24 +69,6 @@
         .GetStream
         (.Write bytes 0 (.Length bytes)))))
 
-(defn writer [kind request client]
-  (let [id (str (get request "id"))
-        session (str (get-session request))
-        client client
-        kind kind
-        string-builder (StringBuilder.)]
-    (proxy [TextWriter] [kind request client]
-      (Encoding [] Encoding/UTF8)
-      (Write [value]
-        (.Append string-builder value))
-      (Flush []
-        (send-message!
-         (bdict {"id" id
-                 kind (.ToString string-builder)
-                 "session" session})
-         client)
-        (.Clear string-builder)))))
-
 (defn new-session!
   ([]
    (new-session! default-session-bindings))
@@ -93,13 +77,13 @@
      (swap! sessions assoc new-guid bindings)
      new-guid)))
 
-(defn clone-session! [original-guid]
-  (new-session! (@sessions original-guid)))
-
 (defn get-session [message]
   (if (get message "session")
     (Guid/Parse (str (get message "session")))
     (new-session!)))
+
+(defn clone-session! [original-guid]
+  (new-session! (@sessions original-guid)))
 
 (defn update-session! [session new-bindings]
   (swap! sessions update session merge new-bindings))
@@ -158,6 +142,24 @@
     :default
     bobj))
 
+(defn writer [kind request client]
+  (let [id (str (get request "id"))
+        session (str (get-session request))
+        client client
+        kind kind
+        string-builder (StringBuilder.)]
+    (proxy [TextWriter] []
+      (Encoding [] Encoding/UTF8)
+      (Write [value]
+        (.Append string-builder value))
+      (Flush []
+        (send-message!
+         (bdict {"id" id
+                 kind (.ToString string-builder)
+                 "session" session})
+         client)
+        (.Clear string-builder)))))
+
 (defn find-file-ns [message]
   ;; Look up from "file" to "Assets" to get the NS.
   ;; NB> This can probably be done much easier through the message
@@ -166,28 +168,31 @@
   (try
     (let [[path current ns-list] (loop [path (str (get message "file"))
                                        current nil
-                                       ns-list []]
+                                        ns-list []]
                                   (if (and (some? path)
-                                           (not= current "Assets"))
+                                           (not= current "Assets")
+                                           (or (File/Exists path)
+                                               (Directory/Exists path)))
                                     (recur (.FullName (Directory/GetParent path))
                                            (Path/GetFileNameWithoutExtension path)
                                            (conj ns-list current))
                                     [path
                                      current
                                      (drop 1 (reverse ns-list))]))
-         full-ns (clojure.string/join "." ns-list)]
+          full-ns (clojure.string/join "." ns-list)]
      (a/log (str "Trying to find: " full-ns))
-     (let [result (find-ns full-ns)]
+     (let [result (and (not-empty full-ns) (find-ns full-ns))]
        ;; Just logging for now to be verbose for conversion sake
        (if result
          (a/log (str "Found: " full-ns))
          (a/log ":file was not a valid ns"))
        result))
     (catch Exception ex
-      (a/log ex)
+      (a/log (str ex))
       (a/log ":file was not a valid ns"))))
 
 (defn do-eval [message]
+  ;; TODO: This needs to run from the main thread for Unity's purposes
   (let [session          (get-session message)
         code             (str (get message "code"))
         session-bindings (get @sessions session)
@@ -195,17 +200,14 @@
         err-writer       (writer "err" message @client)
         ;; We want to change session context to ns in message before eval-ing
         file-ns          (find-file-ns message)
-        eval-bindings    (come-> (assoc session-bindings
-                                        *out* out-writer
-                                        *err* err-writer)
-                                 file-ns (assoc *ns* file-ns))]
-    (def debug-eval-bindings eval-bindings)
-    ;; TODO: Does somthing need parsed here? Probably...
+        eval-bindings    (cond-> (assoc session-bindings
+                                        #'*out* out-writer
+                                        #'*err* err-writer)
+                                 file-ns (assoc #'*ns* file-ns))]
     (with-bindings eval-bindings
       (try
         (let [result (eval (read-string {:read-cond :allow} code))
               value  (pr-str result)]
-          ;; TODO: Is this right?
           (var-set #'*3 *2)
           (var-set #'*2 *1)
           (var-set #'*1 result)
@@ -234,7 +236,7 @@
                          @client)
           (send-message! (bdict {"id" (get message "id")
                                  "session" (str session)
-                                 "err" (str (error-string e))})
+                                 "err" (str (socket-repl/error-string e))})
                          @client)
           (send-message! (bdict {"id" (get message "id")
                                  "status" (blist ["done"])
@@ -248,13 +250,12 @@
   )
 
 (defn handle-message [message]
-  #_{:pre [(= (str k) "id") ;; Assumption: The first element is always "id"
-           (> (count message) 0)]} ;; Assumption: There's going to be a "thing" per id of message
   (let [op-value                        (get message "op")
         auto-completion-support-enabled false
         session                         (get message "session" (new-session!))]
     ;; All ops are documented here:
     ;; - https://nrepl.org/nrepl/ops.html
+    ;; TODO: How to do inspector? I could probably use clojure/reflect if needed
     (case (str op-value)
       "clone"
       (let [cloned-session (clone-session! session)]
@@ -291,18 +292,12 @@
                                                "incremental" 3})})})
                       @client))
       "eval"
-      ;; Example eval. This is run by cider before running the actual code (I assume this is to switch the repl context to the proper namespace)
-      #_{"nrepl.middleware.print/print" "cider.nrepl.pprint/pprint", "file" "*cider-repl Assets/game:localhost:37222(clj)*", "line" 35, "code" "(clojure.core/apply clojure.core/require clojure.main/repl-requires)", "nrepl.middleware.print/options" {"right-margin" 74}, "id" "4", "op" "eval", "inhibit-cider-middleware" "true", "session" "be6aea4a-e326-4162-9e67-6e718c892402", "nrepl.middleware.print/stream?" "1", "nrepl.middleware.print/buffer-size" 4096, "nrepl.middleware.print/quota" 1048576, "column" 1}
-      #_{"code" "(ns game.repl\n  (:require [arcadia.core :as a]\n            [arcadia.internal.config :as config]\n            [clojure.core])\n  (:import [System.Net.Sockets TcpListener]\n           [BencodeNET.Parsing BencodeParser]\n           [BencodeNET.Objects IBObject BDictionary BList BString BNumber]\n           [System Guid]\n           [System.Collections.Generic KeyValuePair]\n           [clojure.lang Namespace]\n           ;; Arcadia Only\n           [UnityEngine GameObject]))\n",
-       "id" "21",
-       "op" "eval",
-         "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
       ;; nREPL's eval Details: https://github.com/nrepl/nrepl/blob/8223894f6c46a2afd71398517d9b8fe91cdf715d/src/clojure/nrepl/middleware/interruptible_eval.clj#L57-L66
+      ;; Example:
+      ;; {"nrepl.middleware.print/print" "cider.nrepl.pprint/pr", "file" "/Users/danielmosora/Development/Projects/games/golmud/Golmud/Assets/game/core.clj", "line" 69, "code" "(+ 1 1)", "ns" "game.core", "id" "13", "op" "eval", "session" "c6e0ffcf-5fdc-407a-89df-001c4bb6c73d", "nrepl.middleware.print/stream?" [], "nrepl.middleware.print/quota" 1048576, "column" 1}
       (do
         (a/log "EVAL")
         (a/log (str "eval MSG: " message))
-        ;; TODO: Does this need to do anything with sessions? Queue per session? Context per session?
-        ;; TODO: Do I need to do something special with eval to switch into the proper namespace?
         #_(swap! repl-eval-queue conj (read-string (get message "code")))
         (do-eval message))
       "load-file"
@@ -317,7 +312,10 @@
         (a/log (str "load-file MSG: " message))
         ;; TODO: Should this do things with the file? Return values?
         ;; NB> `file` contains the source of the whole file.
-        (swap! repl-eval-queue conj (read-string (get message "file"))))
+        ;; - NRepl.cs just wraps it in a `do` and goes to town
+        (do-eval (assoc message "code"
+                        (bstr (str "(do " (get message "file") " )"))))
+        #_(swap! repl-eval-queue conj (read-string (get message "file"))))
       "eldoc"
       ;; Example eldoc
       #_{"id" "25",
@@ -370,90 +368,91 @@
   ;; Do stuff
   ;; TODO: Do we need to have this many futures on futures? Threads on threads?
   ;; Also... how do I stop one of these?
-  (future
-    (let [listener (TcpListener. (IPAddress/Loopback) port)]
-      (try
-        (.Start listener)
-        (loop []
-          (if (not (.Pending listener))
-            (do (Thread/Sleep 100)
-                (recur))
-            ;; TODO: Refactor out this atomic state where possible
-            (do
-              (reset! client (.AcceptTcpClient listener))
-              (reset!
-               repl-future
-               (future
-                 (a/log (format "nrepl: connected to client %s" (.. @client Client RemoteEndPoint)))
-                 (let [parser (BencodeParser.)]
-                   (reset! client-running true)
-                   (reset! buffer (byte-array (* 1024 8)))
-                   ;; TODO: This could be a loop recur, or maybe an
-                   ;; agent???
-                   ;; TODO: I think since `running` is a static class
-                   ;; level variable in the original code, the author was
-                   ;; trying to leave the option open to close the loop
-                   ;; from outside the `NRepl` class. I guess it should
-                   ;; still be a public atom then???
-                   (while (and @running @client-running)
-                     (try
-                       ;; NB> This should disposes when it's done...
-                       ;; TODO: Test and conirm this
-                       (with-open [ms (MemoryStream.)]
-                         (loop []
-                           (let [should-recur?
-                                 (try
-                                   (let [total (-> @client .GetStream (.Read @buffer 0 (.Length @buffer)))]
-                                     (a/log (str "Total bytes::: " total))
-                                     (when (= 0 total)
-                                       (reset! client-running false))
-                                     (when-not (= total 0)
-                                       (.Write ms @buffer 0 total)
-                                       (set! (.. ms Position) 0)
-                                       ;; TODO: There's error handling
-                                       ;; here in the NRepl.cs file, but
-                                       ;; I'm not quite sure how to
-                                       ;; translate it, so lets see how
-                                       ;; often it occurs
-                                       ;; TODO: sometimes the parse here
-                                       ;; fails because the binary has 2
-                                       ;; "session" keys, it fails in
-                                       ;; Parse, so may be good to handle
-                                       ;; that more gracefully
-                                       (when-let [obj (.Parse parser ms)]
-                                         (a/log "GOT A MESSAGE!!!")
-                                         (let [clj-msg (bobject->clj obj)]
-                                           (a/log clj-msg)
-                                           (handle-message clj-msg))
-                                         false)
-                                       ))
-                                   (catch Exception e
-                                     ;; TODO: I'm assuming all exceptions are "read more", but seems that's not true, see TODO above
-                                     (a/log e) ;; TODO: This could be a "big big message" exception
-                                     (.Seek ms 0 SeekOrigin/End)
-                                     true
-                                     ))]
-                             (when should-recur?
-                               (recur))))
-                         )
-                       ;; Catch Gracefully
-                       (catch SocketException e
-                         (reset! client-running false))
-                       (catch IOException e
-                         (reset! client-running false))
-                       (catch ObjectDisposedException e
-                         (reset! client-running false))
-                       ;; Catch and log, this is different
-                       (catch Exception e
-                         (a/log (format "nrepl: %s" e))
-                         (reset! client-running false)))
-                     ))))))
-          )
-        (catch Exception e
-          (a/log (format "Exception in outer future: %s" e)))
-        (finally
-          (a/log (format "nrepl: closing port %s" port))
-          (.Stop listener)))))
+  (def the-repl-future
+    (future
+      (let [listener (TcpListener. (IPAddress/Loopback) port)]
+        (try
+          (.Start listener)
+          (loop []
+            (if (not (.Pending listener))
+              (do (Thread/Sleep 100)
+                  (recur))
+              ;; TODO: Refactor out this atomic state where possible
+              (do
+                (reset! client (.AcceptTcpClient listener))
+                (reset!
+                 repl-future
+                 (future
+                   (a/log (format "nrepl: connected to client %s" (.. @client Client RemoteEndPoint)))
+                   (let [parser (BencodeParser.)]
+                     (reset! client-running true)
+                     (reset! buffer (byte-array (* 1024 8)))
+                     ;; TODO: This could be a loop recur, or maybe an
+                     ;; agent???
+                     ;; TODO: I think since `running` is a static class
+                     ;; level variable in the original code, the author was
+                     ;; trying to leave the option open to close the loop
+                     ;; from outside the `NRepl` class. I guess it should
+                     ;; still be a public atom then???
+                     (while (and @running @client-running)
+                       (try
+                         ;; NB> This should disposes when it's done...
+                         ;; TODO: Test and conirm this
+                         (with-open [ms (MemoryStream.)]
+                           (loop []
+                             (let [should-recur?
+                                   (try
+                                     (let [total (-> @client .GetStream (.Read @buffer 0 (.Length @buffer)))]
+                                       (a/log (str "Total bytes::: " total))
+                                       (when (= 0 total)
+                                         (reset! client-running false))
+                                       (when-not (= total 0)
+                                         (.Write ms @buffer 0 total)
+                                         (set! (.. ms Position) 0)
+                                         ;; TODO: There's error handling
+                                         ;; here in the NRepl.cs file, but
+                                         ;; I'm not quite sure how to
+                                         ;; translate it, so lets see how
+                                         ;; often it occurs
+                                         ;; TODO: sometimes the parse here
+                                         ;; fails because the binary has 2
+                                         ;; "session" keys, it fails in
+                                         ;; Parse, so may be good to handle
+                                         ;; that more gracefully
+                                         (when-let [obj (.Parse parser ms)]
+                                           (a/log "GOT A MESSAGE!!!")
+                                           (let [clj-msg (bobject->clj obj)]
+                                             (a/log clj-msg)
+                                             (handle-message clj-msg))
+                                           false)
+                                         ))
+                                     (catch Exception e
+                                       ;; TODO: I'm assuming all exceptions are "read more", but seems that's not true, see TODO above
+                                       (a/log e) ;; TODO: This could be a "big big message" exception
+                                       (.Seek ms 0 SeekOrigin/End)
+                                       true
+                                       ))]
+                               (when should-recur?
+                                 (recur))))
+                           )
+                         ;; Catch Gracefully
+                         (catch SocketException e
+                           (reset! client-running false))
+                         (catch IOException e
+                           (reset! client-running false))
+                         (catch ObjectDisposedException e
+                           (reset! client-running false))
+                         ;; Catch and log, this is different
+                         (catch Exception e
+                           (a/log (format "nrepl: %s" e))
+                           (reset! client-running false)))
+                       ))))))
+            )
+          (catch Exception e
+            (a/log (format "Exception in outer future: %s" e)))
+          (finally
+            (a/log (format "nrepl: closing port %s" port))
+            (.Stop listener))))))
   )
 
 (defn stop-server []
@@ -474,3 +473,9 @@
   )
 
 (a/log "reloaded game.repl!")
+
+(comment
+  (start-server)
+  game.repl/message
+  (future-cancel game.repl/the-repl-future)
+  )
