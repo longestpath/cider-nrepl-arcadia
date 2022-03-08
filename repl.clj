@@ -20,6 +20,7 @@
 ;; Process: Find out the opcodes through Unity and just figure them out one by one
 ;; Documentation: This is the structure and design of nREPL. This set of docs also contains a lot about the specifics of the transport and protocol https://nrepl.org/nrepl/design/overview.html
 ;; TODO: How to make cider-jack-in work? Can it work in CLR?
+;; - I guess cider-jack-in probably needs a "run" command of some kind
 
 (def ^:const port 37222) ;; My own REPL
 
@@ -36,16 +37,16 @@
 ;; - That way anything eval'd by this repl executes on the main thread
 ;;   without requiring an editor callback
 (defonce repl-eval-queue (atom []))
-(defn maybe-eval-queued-action []
+(defn maybe-eval-queued-action [_ _]
   ;; TODO: In order to provide interruption, I think I will need to figure
   ;; out how to handle a cancellation token here. Update shouldn't be
   ;; throwing exceptions.
   (let [[action & rest] @repl-eval-queue]
     (when action
-      (eval action)
+      (action)
       (reset! repl-eval-queue rest))))
 (defonce repl-main-obj (let [obj (GameObject. "nREPL")]
-                         a/hook+ obj :update :repl #'maybe-eval-queued-action))
+                         (a/hook+ obj :update :repl #'maybe-eval-queued-action)))
 
 ;; NB> These are the default bindings that make the eval happen in the
 ;; proper session context.
@@ -193,57 +194,63 @@
 
 (defn do-eval [message]
   ;; TODO: This needs to run from the main thread for Unity's purposes
-  (let [session          (get-session message)
-        code             (str (get message "code"))
-        session-bindings (get @sessions session)
-        out-writer       (writer "out" message @client)
-        err-writer       (writer "err" message @client)
-        ;; We want to change session context to ns in message before eval-ing
-        file-ns          (find-file-ns message)
-        eval-bindings    (cond-> (assoc session-bindings
-                                        #'*out* out-writer
-                                        #'*err* err-writer)
-                                 file-ns (assoc #'*ns* file-ns))]
-    (with-bindings eval-bindings
-      (try
-        (let [result (eval (read-string {:read-cond :allow} code))
-              value  (pr-str result)]
-          (var-set #'*3 *2)
-          (var-set #'*2 *1)
-          (var-set #'*1 result)
-          (update-session! session (get-thread-bindings))
-          (send-message! (bdict {"id"     (get message "id")
-                                 "value"   value
-                                 "ns"      (str *ns*)
-                                 "session" (str session)})
-                         @client)
-          (.Flush out-writer)
-          (.Flush err-writer)
-          (send-message! (bdict {"id" (get message "id")
-                                 "status" (blist ["done"]) ;; // TODO does this have to be a list?
-                                 "session" (str session)})
-                         @client)
+  ;; TODO: For some reason the communication is taking forever, I need to get a good profile to see where it's spending its time.
+  (swap! repl-eval-queue
+         conj
+         (fn []
+           (let [session          (get-session message)
+                 code             (str (get message "code"))
+                 session-bindings (get @sessions session)
+                 out-writer       (writer "out" message @client)
+                 err-writer       (writer "err" message @client)
+                 ;; We want to change session context to ns in message before eval-ing
+                 file-ns          nil ;; TODO: None of this seems to be working.
+                 #_(get message (symbol "ns"))
+                 #_(find-file-ns message)
+                 eval-bindings    (cond-> (assoc session-bindings
+                                                 #'*out* out-writer
+                                                 #'*err* err-writer)
+                                    file-ns (assoc #'*ns* file-ns))]
+             (with-bindings eval-bindings
+               (try
+                 (let [result (eval (read-string {:read-cond :allow} code))
+                       value  (pr-str result)]
+                   (var-set #'*3 *2)
+                   (var-set #'*2 *1)
+                   (var-set #'*1 result)
+                   (update-session! session (get-thread-bindings))
+                   (send-message! (bdict {"id"     (get message "id")
+                                          "value"   value
+                                          "ns"      (str *ns*)
+                                          "session" (str session)})
+                                  @client)
+                   (.Flush out-writer)
+                   (.Flush err-writer)
+                   (send-message! (bdict {"id" (get message "id")
+                                          "status" (blist ["done"]) ;; // TODO does this have to be a list?
+                                          "session" (str session)})
+                                  @client)
 
-          )
-        (catch Exception e
-          (var-set #'*e e)
-          (update-session! session (get-thread-bindings))
-          (send-message! (bdict {"id" (get message "id")
-                                 "status" (blist ["eval-error"])
-                                 "session" (str session)
-                                 "ex" (str (type e)) ;; TODO: Can I return the whole thing here? For cider usage
-                                 })
-                         @client)
-          (send-message! (bdict {"id" (get message "id")
-                                 "session" (str session)
-                                 "err" (str (socket-repl/error-string e))})
-                         @client)
-          (send-message! (bdict {"id" (get message "id")
-                                 "status" (blist ["done"])
-                                 "session" (str session)
-                                 })
-                         @client)
-          (throw e)))))
+                   )
+                 (catch Exception e
+                   (var-set #'*e e)
+                   (update-session! session (get-thread-bindings))
+                   (send-message! (bdict {"id" (get message "id")
+                                          "status" (blist ["eval-error"])
+                                          "session" (str session)
+                                          "ex" (str (type e)) ;; TODO: Can I return the whole thing here? For cider usage
+                                          })
+                                  @client)
+                   (send-message! (bdict {"id" (get message "id")
+                                          "session" (str session)
+                                          "err" (str (socket-repl/error-string e))})
+                                  @client)
+                   (send-message! (bdict {"id" (get message "id")
+                                          "status" (blist ["done"])
+                                          "session" (str session)
+                                          })
+                                  @client)
+                   (throw e)))))))
   ;; TODO: Unsure if this is needed, but it wants a null return so lets
   ;; make it explicit
   nil
@@ -307,7 +314,7 @@
        "file-path" "/Users/danielmosora/Development/Projects/games/golmud/Golmud/Assets/game/core.clj",
        "id" "43",
        "op" "load-file",
-       "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
+         "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
       (do
         (a/log (str "load-file MSG: " message))
         ;; TODO: Should this do things with the file? Return values?
@@ -375,7 +382,7 @@
           (.Start listener)
           (loop []
             (if (not (.Pending listener))
-              (do (Thread/Sleep 100)
+              (do (Thread/Sleep 40)
                   (recur))
               ;; TODO: Refactor out this atomic state where possible
               (do
