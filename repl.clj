@@ -43,7 +43,11 @@
   ;; throwing exceptions.
   (let [[action & rest] @repl-eval-queue]
     (when action
-      (action)
+      (try
+        (action)
+        (catch Exception ex
+          ;; TODO: Return this to the frontend as eval error? Check nrepl eval error handling
+          (a/log ex)))
       (reset! repl-eval-queue rest))))
 (defonce repl-main-obj (let [obj (GameObject. "nREPL")]
                          (a/hook+ obj :update :repl #'maybe-eval-queued-action)))
@@ -65,6 +69,8 @@
 (declare repl-future)
 
 (defn send-message! [message client]
+  (def xmessage message)
+  (def xclient client)
   (let [bytes (.EncodeAsBytes message)]
     (-> client
         .GetStream
@@ -87,7 +93,9 @@
   (new-session! (@sessions original-guid)))
 
 (defn update-session! [session new-bindings]
-  (swap! sessions update session merge new-bindings))
+  ;; NB> This assumes that the new-bindings are the full set of bindings
+  ;; to use for the session.
+  (swap! sessions update session assoc new-bindings))
 
 (defn bnum [n]
   (BNumber. n))
@@ -226,6 +234,8 @@
                                   @client)
                    (.Flush out-writer)
                    (.Flush err-writer)
+
+                   ;; TODO: Do I need to do this?
                    (send-message! (bdict {"id" (get message "id")
                                           "status" (blist ["done"]) ;; // TODO does this have to be a list?
                                           "session" (str session)})
@@ -235,6 +245,11 @@
                  (catch Exception e
                    (var-set #'*e e)
                    (update-session! session (get-thread-bindings))
+                   ;; Returns
+                   ;; :ex The type of exception thrown, if any. If present, then :value will be absent.
+                   ;; :ns *ns*, after successful evaluation of code.
+                   ;; :root-ex The type of the root exception thrown, if any. If present, then :value will be absent.
+                   ;; :value The result of evaluating code, often readable. This printing is provided by the print middleware. Superseded by ex and root-ex if an exception occurs during evaluation.
                    (send-message! (bdict {"id" (get message "id")
                                           "status" (blist ["eval-error"])
                                           "session" (str session)
@@ -256,6 +271,134 @@
   nil
   )
 
+(defn handle-clone [op-value message auto-completion-support-enabled session]
+  (let [cloned-session (clone-session! session)]
+    (send-message!
+     (bdict
+      {"id"          (get message "id")
+       "status"      (blist ["done"])
+       "new-session" (.ToString cloned-session)})
+     @client)))
+
+(defn handle-describe [op-value message auto-completion-support-enabled session]
+  ;; TODO: How to declare not available? Seems like lack of presence is the only way... these 0's don't work
+  (let [supported-ops (bdict {"eval" 0
+                              "load-file" 1
+                              "describe" 0
+                              "clone" 1
+                              "info" 1
+                              "eldoc" 1
+                              ;;"classpath" 1
+                              "complete" 1
+                              ;; This also doesn't seem to work to get emacs to send a macroexpand op
+                              "macroexpand" 1})]
+    (a/log "DESCRIBE")
+    (send-message! (bdict
+                    {"id" (get message "id")
+                     "session" (.ToString session)
+                     "status" (blist ["done"])
+                     "ops" supported-ops
+                     "versions" (bdict
+                                 {"clojure" (bdict
+                                             clojure.core/*clojure-version*)
+                                  "nrepl" (bdict
+                                           {"major" 0
+                                            "minor" 2
+                                            "incremental" 3})})})
+                   @client)))
+
+(defn handle-eval [op-value message auto-completion-support-enabled session]
+  ;; nREPL's eval Details: https://github.com/nrepl/nrepl/blob/8223894f6c46a2afd71398517d9b8fe91cdf715d/src/clojure/nrepl/middleware/interruptible_eval.clj#L57-L66
+  ;; Example:
+  ;; {"nrepl.middleware.print/print" "cider.nrepl.pprint/pr", "file" "/Users/danielmosora/Development/Projects/games/golmud/Golmud/Assets/game/core.clj", "line" 69, "code" "(+ 1 1)", "ns" "game.core", "id" "13", "op" "eval", "session" "c6e0ffcf-5fdc-407a-89df-001c4bb6c73d", "nrepl.middleware.print/stream?" [], "nrepl.middleware.print/quota" 1048576, "column" 1}
+  (do
+    (a/log "EVAL")
+    (a/log (str "eval MSG: " message))
+    #_(swap! repl-eval-queue conj (read-string (get message "code")))
+    (do-eval message)))
+
+(defn handle-load-file [op-value message auto-completion-support-enabled session]
+  ;; Example load-file
+  #_{"file" "(ns game.core\n  (:require [arcadia.core :as a]\n            [arcadia.linear :as l]\n            [game.repl :as repl]\n            [game.utils :as utils])\n  (:import [UnityEngine\n            Application\n            QualitySettings\n            GameObject\n            Component\n            Transform]))\n\n(defn init-fps!\n  \"From Saikyun demo #2: https://www.youtube.com/watch?v=HoeUi2aOFxU&t=29s\"\n  [& _]\n  (set! .... [full file content that was eval'd]",
+     "file-name" "core.clj",
+     "file-path" "/Users/danielmosora/Development/Projects/games/golmud/Golmud/Assets/game/core.clj",
+     "id" "43",
+     "op" "load-file",
+     "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
+  (do
+    (a/log (str "load-file MSG: " message))
+    ;; TODO: Should this do things with the file? Return values?
+    ;; NB> `file` contains the source of the whole file.
+    ;; - NRepl.cs just wraps it in a `do` and goes to town
+    (do-eval (assoc message "code"
+                    (bstr (str "(do " (get message "file") " )"))))
+    #_(swap! repl-eval-queue conj (read-string (get message "file")))))
+
+(defn handle-eldoc [op-value message auto-completion-support-enabled session]
+  ;; Info example
+  ;; {"id" "113", "ns" "game.repl", "op" "info", "session" "c7322193-767c-40e9-80e8-89d3739ea974", "sym" "a/log"}
+  ;; Example eldoc
+  #_{"id"      "25",
+     "ns"      "game.core",
+     "op"      "eldoc",
+     "session" "c7322193-767c-40e9-80e8-89d3739ea974",
+     "sym"     "comment"}
+  (a/log (str op-value " MSG: " message))
+  (let [ns-str     (str (get message "ns"))
+        symbol-str (str (get message "symbol"))]
+    ;; // Editors like Calva that support doc-on-hover sometimes will ask about empty strings or spaces
+    (when-not (or (= "" symbol-str)
+                  (nil? symbol-str)
+                  (= " " symbol-str))
+      (let [symbol-metadata (try
+                              (meta (ns-resolve (find-ns (symbol ns-str)) (symbol symbol-str)))
+                              (catch TypeNotFoundException ex
+                                ;; // We'll just ignore this call if the type cannot be found. This happens sometimes.
+                                ;; // TODO: One particular case when this happens is when querying info for a namespace.
+                                ;; //       That case should be handled separately (e.g., via `find-ns`?)
+                                (a/log (format "ELDOC ERROR: %s" ex))))]
+        (if symbol-metadata
+          (send-message! (bdict
+                          (into {"id"      (get message "id")
+                                 "session" (.ToString session)
+                                 "status"  (blist ["done"])}
+                                (->> symbol-metadata
+                                     (filter #(.val %))
+                                     (map (fn [entry]
+                                            (let [key-str (.Substring (.ToString (.key entry)) 1)]
+                                              [(case key-str
+                                                 "arglists" "arglists-str"
+                                                 "forms"    "forms-str"
+                                                 key-str)
+                                               (.ToString (.val entry))])))))))
+          (send-message! (bdict
+                          {"id"      (get message "id")
+                           "session" (.ToString session)
+                           "status"  (blist ["done", "no-info"])}))))))
+  )
+
+(defn handle-complete [op-value message auto-completion-support-enabled session]
+  (a/log (str "complete MSG: " message)))
+
+(defn handle-classpath [op-value message auto-completion-support-enabled session]
+  ;; Classpath example
+  ;; No idea what this does, but it happened on re-connect
+  ;; - Seems like it's not implemented? https://github.com/nrepl/nrepl/search?q=classpath
+  ;; {"id" "155", "op" "classpath", "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
+  (a/log (str "classpath MSG: " message)))
+
+(defn handle-close [op-value message auto-completion-support-enabled session]
+  ;; TODO: This is needed to be able to loop well
+  ;; - Close and clear out the session
+  ;; - Should this also stop the server?
+  ;; {"id" "132", "op" "close", "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
+  (a/log (str "close MSG: " message)))
+
+(defn handle-macroexpand [op-value message auto-completion-support-enabled session]
+  ;; TODO: This is probably going to be a tough op to implement because cider won't send it unless it's provided as a middleware it seems?
+  ;; Message: ‘cider-macroexpand-1’ requires the nREPL op "macroexpand" (provided by cider-nrepl)
+  (a/log (str "close MSG: " message)))
+
 (defn handle-message [message]
   (let [op-value                        (get message "op")
         auto-completion-support-enabled false
@@ -265,95 +408,28 @@
     ;; TODO: How to do inspector? I could probably use clojure/reflect if needed
     (case (str op-value)
       "clone"
-      (let [cloned-session (clone-session! session)]
-        (send-message!
-         (bdict
-          {"id"          (get message "id")
-           "status"      (blist ["done"])
-           "new-session" (.ToString cloned-session)})
-         @client))
+      (handle-clone op-value message auto-completion-support-enabled session)
       "describe"
-      ;; TODO: How to declare not available? Seems like lack of presence is the only way... these 0's don't work
-      (let [supported-ops (bdict {"eval" 0
-                                  "load-file" 1
-                                  "describe" 0
-                                  "clone" 1
-                                  "info" 1
-                                  "eldoc" 1
-                                  "classpath" 1
-                                  "complete" 1
-                                  ;; This also doesn't seem to work to get emacs to send a macroexpand op
-                                  "macroexpand" 1})]
-        (a/log "DESCRIBE")
-        (send-message! (bdict
-                       {"id" (get message "id")
-                        "session" (.ToString session)
-                        "status" (blist ["done"])
-                        "ops" supported-ops
-                        "versions" (bdict
-                                    {"clojure" (bdict
-                                                clojure.core/*clojure-version*)
-                                     "nrepl" (bdict
-                                              {"major" 0
-                                               "minor" 2
-                                               "incremental" 3})})})
-                      @client))
+      (handle-describe op-value message auto-completion-support-enabled session)
       "eval"
-      ;; nREPL's eval Details: https://github.com/nrepl/nrepl/blob/8223894f6c46a2afd71398517d9b8fe91cdf715d/src/clojure/nrepl/middleware/interruptible_eval.clj#L57-L66
-      ;; Example:
-      ;; {"nrepl.middleware.print/print" "cider.nrepl.pprint/pr", "file" "/Users/danielmosora/Development/Projects/games/golmud/Golmud/Assets/game/core.clj", "line" 69, "code" "(+ 1 1)", "ns" "game.core", "id" "13", "op" "eval", "session" "c6e0ffcf-5fdc-407a-89df-001c4bb6c73d", "nrepl.middleware.print/stream?" [], "nrepl.middleware.print/quota" 1048576, "column" 1}
-      (do
-        (a/log "EVAL")
-        (a/log (str "eval MSG: " message))
-        #_(swap! repl-eval-queue conj (read-string (get message "code")))
-        (do-eval message))
+      (handle-eval op-value message auto-completion-support-enabled session)
       "load-file"
-      ;; Example load-file
-      #_{"file" "(ns game.core\n  (:require [arcadia.core :as a]\n            [arcadia.linear :as l]\n            [game.repl :as repl]\n            [game.utils :as utils])\n  (:import [UnityEngine\n            Application\n            QualitySettings\n            GameObject\n            Component\n            Transform]))\n\n(defn init-fps!\n  \"From Saikyun demo #2: https://www.youtube.com/watch?v=HoeUi2aOFxU&t=29s\"\n  [& _]\n  (set! (.. QualitySettings vSyncCount) 0)\n  (set! (.. Application targetFrameRate) 15))\n\n(defn load-hooks\n  \"\n  This function is to stash hooks that need to be added once while REPL developing. Add them here, then they will come back the next time.\n\n  This should possibly be an import time \\\"add\\\" and a post-import \\\"run\\\"\n  situation, so that each namespace can specify their own, but it's only\n  run once.\n  \"\n  []\n  (a/hook+ (a/object-named \"Main Camera\") :start :init-fps #'game.core/init-fps!))\n\n(defn start [& _]\n  (repl/start-server)\n  (utils/clean-scene)\n  (let [c1 (utils/create-primitive :cube \"BeheldCube\")]\n    (set! (.. c1 transform position)\n          (l/v3 3 3 3))\n    #_(a/hook+ c1 :update :moveit #'move!))\n  (utils/create-primitive :cube \"Hello World\"))\n\n;; How to persist hook adding in clojure? I feel like defonce might still be the way to do it, but the result of the hooks is def'd\n\n;; Start (does our clear on save)\n#_(start)\n\n;; Load our hooks (once)\n(defonce hooks-loaded (atom false))\n(when-not @hooks-loaded\n  (load-hooks)\n  (reset! hooks-loaded true))\n\n(comment\n  ;; This is how I added the first hook.\n  (a/hook+ (a/object-named \"Main Camera\") :start :main #'game.core/start)\n  (set! (.. (a/object-named \"Hello World\") transform position) (l/v3 3 3 3))\n  (a/destroy (a/object-named \"Hello World\"))\n\n  ;; TODO: Figure out how to ship this REPL and connect to it remotely.\n  ;; -- I think I can do it without modification of Arcadia using socket-repl, but then I'll have to use socket-repl...\n  ;; -- That said, it IS much more straightforward to run.\n  (init-fps!)\n\n  ;; Main goal: Have a space where you can manipulate the world. The way to do so, should be pluggable so it can be expanded.\n  ;; Interacting via hooks allows UnityUpdate stuff to be changed in real time.\n  ;; - So, interaction should be a hook on the character controller (or whatever that will end up being in VR)\n  ;; - That way I can develop everything interactively via the REPL.\n  (repl/start-server)\n  (repl/stop-server)\n  )\n\n(a/log \"reloaded core.clj!\")\n",
-       "file-name" "core.clj",
-       "file-path" "/Users/danielmosora/Development/Projects/games/golmud/Golmud/Assets/game/core.clj",
-       "id" "43",
-       "op" "load-file",
-         "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
-      (do
-        (a/log (str "load-file MSG: " message))
-        ;; TODO: Should this do things with the file? Return values?
-        ;; NB> `file` contains the source of the whole file.
-        ;; - NRepl.cs just wraps it in a `do` and goes to town
-        (do-eval (assoc message "code"
-                        (bstr (str "(do " (get message "file") " )"))))
-        #_(swap! repl-eval-queue conj (read-string (get message "file"))))
+      (handle-load-file op-value message auto-completion-support-enabled session)
       "eldoc"
-      ;; Example eldoc
-      #_{"id" "25",
-       "ns" "game.core",
-       "op" "eldoc",
-       "session" "c7322193-767c-40e9-80e8-89d3739ea974",
-       "sym" "comment"}
-      (a/log (str "eldoc MSG: " message))
+      (handle-eldoc op-value message auto-completion-support-enabled session)
       "info"
-      ;; Info example
-      ;; {"id" "113", "ns" "game.repl", "op" "info", "session" "c7322193-767c-40e9-80e8-89d3739ea974", "sym" "a/log"}
-      (a/log (str "info MSG: " message))
+      (handle-eldoc op-value message auto-completion-support-enabled session)
       "complete"
-      (a/log (str "complete MSG: " message))
+      (handle-complete op-value message auto-completion-support-enabled session)
+
       "classpath"
-      ;; Classpath example
-      ;; No idea what this does, but it happened on re-connect
-      ;; - Seems like it's not implemented? https://github.com/nrepl/nrepl/search?q=classpath
-      ;; {"id" "155", "op" "classpath", "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
-      (a/log (str "classpath MSG: " message))
+      (handle-classpath op-value message auto-completion-support-enabled session)
+
       "close"
-      ;; TODO: This is needed to be able to loop well
-      ;; - Close and clear out the session
-      ;; - Should this also stop the server?
-      ;; {"id" "132", "op" "close", "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
-      (a/log (str "close MSG: " message))
+      (handle-close op-value message auto-completion-support-enabled session)
 
       "macroexpand"
-      ;; TODO: This is probably going to be a tough op to implement because cider won't send it unless it's provided as a middleware it seems?
-      ;; Message: ‘cider-macroexpand-1’ requires the nREPL op "macroexpand" (provided by cider-nrepl)
-      (a/log (str "close MSG: " message))
+      (handle-macroexpand op-value message auto-completion-support-enabled session)
 
       ;; Default
       ;; UNIMPLEMENTED: {"id" "55", "name" "-main", "op" "ns-list-vars-by-name", "session" "c7322193-767c-40e9-80e8-89d3739ea974"}
