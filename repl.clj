@@ -345,7 +345,7 @@
      "sym"     "comment"}
   (a/log (str op-value " MSG: " message))
   (let [ns-str     (str (get message "ns"))
-        symbol-str (str (get message "symbol"))]
+        symbol-str (str (or (get message "symbol") (get message "sym")))]
     ;; // Editors like Calva that support doc-on-hover sometimes will ask about empty strings or spaces
     (when-not (or (= "" symbol-str)
                   (nil? symbol-str)
